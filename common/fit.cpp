@@ -9,6 +9,7 @@
 #include <cassert>
 #include <stdexcept>
 #include <cinttypes>
+#include <mutex>
 #include <set>
 #include <string>
 #include <vector>
@@ -901,6 +902,21 @@ enum common_params_fit_status common_fit_params(
     const int64_t t1_us = llama_time_us();
     LOG_TRC("%s: fitting params to free memory took %.2f seconds\n", __func__, (t1_us - t0_us) * 1e-6);
     return status;
+}
+
+extern "C" int32_t llama_common_fit_params(
+        const char * path_model,
+        llama_model_params * mparams,
+        llama_context_params * cparams,
+        float * tensor_split,
+        llama_model_tensor_buft_override * tensor_buft_overrides,
+        size_t * margins,
+        uint32_t n_ctx_min) {
+    static std::mutex fit_mutex;
+    std::lock_guard<std::mutex> lock(fit_mutex);
+    return static_cast<int32_t>(common_fit_params(
+        path_model, mparams, cparams, tensor_split, tensor_buft_overrides,
+        margins, n_ctx_min, nullptr, GGML_LOG_LEVEL_ERROR));
 }
 
 void common_memory_breakdown_print(const struct llama_context * ctx) {

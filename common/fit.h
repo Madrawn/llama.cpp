@@ -37,6 +37,15 @@ common_params_fit_status common_fit_params(
       const common_fit_extra_model * extra,                  // model to fit alongside the main one, nullptr if there is none
                      ggml_log_level   log_level);            // minimum log level to print during fitting, lower levels go to debug log
 
+extern "C" int32_t llama_common_fit_params(
+                         const char * path_model,
+                 llama_model_params * mparams,
+               llama_context_params * cparams,
+                              float * tensor_split,
+    llama_model_tensor_buft_override * tensor_buft_overrides,
+                         size_t * margins,
+                       uint32_t n_ctx_min);
+
 // print estimated memory to stdout
 void common_fit_print(
                          const char * path_model,
