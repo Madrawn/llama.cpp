@@ -219,12 +219,12 @@ static void common_params_fit_tensor_split(
     }
 
     // binary search for maximum n_gpu_layers that fits
-    uint32_t low = 0;
-    uint32_t high = hp_ngl + 1;
+    int64_t low = 0;
+    int64_t high = hp_ngl + 1;
     uint32_t best_ngl = 0;
 
     while (low <= high) {
-        uint32_t mid = low + (high - low) / 2;
+        int64_t mid = low + (high - low) / 2;
 
         llama_model_params mparams_test = *mparams;
         mparams_test.n_gpu_layers = mid;
