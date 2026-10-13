@@ -251,18 +251,20 @@ static void common_params_fit_tensor_split(
     LOG_TRC("%s: best n_gpu_layers = %u\n", __func__, best_ngl);
 
     // try partial layer offload on boundary layer
+    bool partial_fit = false;
     if (best_ngl < hp_ngl + 1) {
         uint32_t boundary_layer = hp_ngl + 1 - (best_ngl + 1);
 
         // try different layer fractions
         common_layer_fraction_t fractions[] = {LAYER_FRACTION_GATE, LAYER_FRACTION_UP, LAYER_FRACTION_ATTN};
+        static std::string pattern; // static: the caller reads the pointer after this returns
         for (common_layer_fraction_t frac : fractions) {
             llama_model_params mparams_test = *mparams;
             mparams_test.n_gpu_layers = best_ngl + 1;
             mparams_test.tensor_split = tensor_split;
 
             // set up tensor_buft_overrides for the boundary layer
-            std::string pattern = "blk\\." + std::to_string(boundary_layer) + "\\.ffn_";
+            pattern = "blk\\." + std::to_string(boundary_layer) + "\\.ffn_";
             switch (frac) {
                 case LAYER_FRACTION_ATTN:
                     pattern += "(gate|up|gate_up|down).*";
@@ -296,14 +298,21 @@ static void common_params_fit_tensor_split(
             if (fits) {
                 LOG_TRC("%s: partial layer offload fits with fraction %d\n", __func__, (int)frac);
                 best_ngl = best_ngl + 1;
+                partial_fit = true;
                 break;
             }
+        }
+        if (!partial_fit) {
+            tensor_buft_overrides[0] = {nullptr, nullptr};
         }
     }
 
     // apply the best configuration
     mparams->n_gpu_layers = best_ngl;
     mparams->tensor_split = tensor_split;
+    if (partial_fit) {
+        mparams->tensor_buft_overrides = tensor_buft_overrides;
+    }
 
     LOG_TRC("%s: fitted n_gpu_layers = %u\n", __func__, best_ngl);
 }
