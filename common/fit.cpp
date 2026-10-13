@@ -188,7 +188,46 @@ static void common_params_fit_tensor_split(
     uint32_t hp_nct = 0;
     uint32_t hp_nex = 0;
 
-    // measure initial memory usage with default parameters
+    std::vector<ggml_backend_dev_t> split_devs;
+    if (mparams->devices) {
+        for (size_t id = 0; mparams->devices[id]; id++) {
+            split_devs.push_back(mparams->devices[id]);
+        }
+    } else {
+        for (size_t id = 0; id < ggml_backend_dev_count(); id++) {
+            auto * dev = ggml_backend_dev_get(id);
+            if (ggml_backend_dev_buffer_type(dev) != ggml_backend_cpu_buffer_type()) {
+                split_devs.push_back(dev);
+            }
+        }
+    }
+    if (split_devs.size() > llama_max_devices()) {
+        throw common_params_fit_exception("too many devices for tensor_split, abort");
+    }
+    if (!tensor_split) {
+        throw common_params_fit_exception("did not provide a buffer to write the tensor_split to, abort");
+    }
+
+    const float * user_split = mparams->tensor_split;
+    bool all_zero = true;
+    if (user_split) {
+        for (size_t id = 0; id < split_devs.size(); id++) {
+            all_zero &= user_split[id] == 0.0f;
+        }
+    }
+    for (size_t id = 0; id < split_devs.size(); id++) {
+        if (all_zero) {
+            size_t free, total;
+            ggml_backend_dev_memory(split_devs[id], &free, &total);
+            tensor_split[id] = (float) std::max<int64_t>((int64_t) free - (int64_t) margins_s[id], 0) / MiB;
+        } else {
+            tensor_split[id] = user_split[id];
+        }
+        LOG_TRC("%s: device %s tensor_split weight = %.3f\n", __func__, ggml_backend_dev_name(split_devs[id]), tensor_split[id]);
+    }
+    mparams->tensor_split = tensor_split;
+
+    // measure initial memory usage with the selected split
     LOG_TRC("%s: getting device memory data for initial parameters:\n", __func__);
     dmds_t dmds_full = common_get_device_memory_data_impl(path_model, mparams, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level);
 
@@ -205,17 +244,7 @@ static void common_params_fit_tensor_split(
         targets.push_back(dmds_full[id].free - (int64_t)margins_s[id]);
     }
 
-    // no user weights: split by free memory, so a partly used device gets less
-    bool user_split = false;
-    for (size_t id = 0; id < nd; id++) {
-        user_split |= tensor_split[id] != 0.0f;
-    }
-    if (!user_split) {
-        for (size_t id = 0; id < nd; id++) {
-            tensor_split[id] = (float) std::max<int64_t>(targets[id], 0);
-        }
-    }
-
+    // shortcut: Meta reports combined memory, use per-GPU estimates if fitting still overflows.
     // check if full offload already fits
     bool full_fits = true;
     for (size_t id = 0; id < nd; id++) {

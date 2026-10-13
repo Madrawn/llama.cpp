@@ -92,6 +92,14 @@
 #include <string>
 #include <vector>
 
+#if defined(_WIN32) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#include <nvml.h>
+#endif
+
 static_assert(sizeof(half) == sizeof(ggml_fp16_t), "wrong fp16 size");
 
 #define GGML_LOG_WARN_ONCE(str) \
@@ -5180,10 +5188,39 @@ static int ggml_cuda_physical_device_share_count(int device) {
     return info.devices[device].physical_share_count;
 }
 
+#if defined(_WIN32) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+static void ggml_cuda_limit_free_memory(int device, size_t * free) {
+    // Keep NVML loaded for the lifetime of its function pointers.
+    static HMODULE library = LoadLibraryExA("nvml.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+    static auto init = library ? reinterpret_cast<decltype(&nvmlInit_v2)>(GetProcAddress(library, "nvmlInit_v2")) : nullptr;
+    static auto get_device = library ? reinterpret_cast<decltype(&nvmlDeviceGetHandleByPciBusId_v2)>(GetProcAddress(library, "nvmlDeviceGetHandleByPciBusId_v2")) : nullptr;
+    static auto get_memory = library ? reinterpret_cast<decltype(&nvmlDeviceGetMemoryInfo)>(GetProcAddress(library, "nvmlDeviceGetMemoryInfo")) : nullptr;
+    static bool ready = init && get_device && get_memory && init() == NVML_SUCCESS;
+    if (!ready) {
+        return;
+    }
+
+    char pci_bus_id[32];
+    if (cudaDeviceGetPCIBusId(pci_bus_id, sizeof(pci_bus_id), ggml_cuda_get_physical_device(device)) != cudaSuccess) {
+        (void) cudaGetLastError();
+        return;
+    }
+    nvmlDevice_t nvml_device;
+    nvmlMemory_t memory;
+    if (get_device(pci_bus_id, &nvml_device) == NVML_SUCCESS && get_memory(nvml_device, &memory) == NVML_SUCCESS) {
+        // WDDM CUDA queries can omit memory used by other processes.
+        *free = std::min(*free, (size_t) memory.free);
+    }
+}
+#endif
+
 void ggml_backend_cuda_get_device_memory(int device, size_t * free, size_t * total) {
     ggml_cuda_set_device(device);
 
     CUDA_CHECK(cudaMemGetInfo(free, total));
+#if defined(_WIN32) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    ggml_cuda_limit_free_memory(device, free);
+#endif
 
     // virtual devices sharing one physical GPU share its memory pool; split it between them
     const int share_count = ggml_cuda_physical_device_share_count(device);
@@ -5334,6 +5371,9 @@ static void ggml_backend_cuda_device_get_memory(ggml_backend_dev_t dev, size_t *
         *total = 0;
         return;
     }
+#if defined(_WIN32) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    ggml_cuda_limit_free_memory(ctx->device, free);
+#endif
 
 // ref: https://github.com/ggml-org/llama.cpp/pull/17368
 #if defined(__linux__) && !defined(GGML_USE_HIP)
