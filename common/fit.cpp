@@ -205,6 +205,17 @@ static void common_params_fit_tensor_split(
         targets.push_back(dmds_full[id].free - (int64_t)margins_s[id]);
     }
 
+    // no user weights: split by free memory, so a partly used device gets less
+    bool user_split = false;
+    for (size_t id = 0; id < nd; id++) {
+        user_split |= tensor_split[id] != 0.0f;
+    }
+    if (!user_split) {
+        for (size_t id = 0; id < nd; id++) {
+            tensor_split[id] = (float) std::max<int64_t>(targets[id], 0);
+        }
+    }
+
     // check if full offload already fits
     bool full_fits = true;
     for (size_t id = 0; id < nd; id++) {
