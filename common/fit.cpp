@@ -176,12 +176,145 @@ common_device_memory_data_vec common_get_device_memory_data(
     return ret;
 }
 
+static void common_params_fit_tensor_split(
+        const char * path_model, struct llama_model_params * mparams, struct llama_context_params * cparams,
+        float * tensor_split, struct llama_model_tensor_buft_override * tensor_buft_overrides,
+        size_t * margins_s, uint32_t n_ctx_min, const common_fit_extra_model * extra, enum ggml_log_level log_level) {
+    constexpr int64_t MiB = 1024*1024;
+    typedef std::vector<llama_device_memory_data> dmds_t;
+
+    std::vector<ggml_backend_dev_t> devs;
+    uint32_t hp_ngl = 0;
+    uint32_t hp_nct = 0;
+    uint32_t hp_nex = 0;
+
+    // measure initial memory usage with default parameters
+    LOG_TRC("%s: getting device memory data for initial parameters:\n", __func__);
+    dmds_t dmds_full = common_get_device_memory_data_impl(path_model, mparams, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level);
+
+    const size_t nd = devs.size();
+    if (nd == 0) {
+        // no GPUs, nothing to fit
+        return;
+    }
+
+    // compute memory targets per device
+    std::vector<int64_t> targets;
+    targets.reserve(nd);
+    for (size_t id = 0; id < nd; id++) {
+        targets.push_back(dmds_full[id].free - (int64_t)margins_s[id]);
+    }
+
+    // check if full offload already fits
+    bool full_fits = true;
+    for (size_t id = 0; id < nd; id++) {
+        if (dmds_full[id].mb.total() > targets[id]) {
+            full_fits = false;
+            break;
+        }
+    }
+    if (full_fits) {
+        LOG_TRC("%s: full offload fits, no changes needed\n", __func__);
+        return;
+    }
+
+    // binary search for maximum n_gpu_layers that fits
+    uint32_t low = 0;
+    uint32_t high = hp_ngl + 1;
+    uint32_t best_ngl = 0;
+
+    while (low <= high) {
+        uint32_t mid = low + (high - low) / 2;
+
+        llama_model_params mparams_test = *mparams;
+        mparams_test.n_gpu_layers = mid;
+        mparams_test.tensor_split = tensor_split;
+
+        dmds_t dmds_test = common_get_device_memory_data_impl(path_model, &mparams_test, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level);
+
+        bool fits = true;
+        for (size_t id = 0; id < nd; id++) {
+            if (dmds_test[id].mb.total() > targets[id]) {
+                fits = false;
+                break;
+            }
+        }
+
+        if (fits) {
+            best_ngl = mid;
+            low = mid + 1;
+        } else {
+            high = mid - 1;
+        }
+    }
+
+    LOG_TRC("%s: best n_gpu_layers = %u\n", __func__, best_ngl);
+
+    // try partial layer offload on boundary layer
+    if (best_ngl < hp_ngl + 1) {
+        uint32_t boundary_layer = hp_ngl + 1 - (best_ngl + 1);
+
+        // try different layer fractions
+        common_layer_fraction_t fractions[] = {LAYER_FRACTION_GATE, LAYER_FRACTION_UP, LAYER_FRACTION_ATTN};
+        for (common_layer_fraction_t frac : fractions) {
+            llama_model_params mparams_test = *mparams;
+            mparams_test.n_gpu_layers = best_ngl + 1;
+            mparams_test.tensor_split = tensor_split;
+
+            // set up tensor_buft_overrides for the boundary layer
+            std::string pattern = "blk\\." + std::to_string(boundary_layer) + "\\.ffn_";
+            switch (frac) {
+                case LAYER_FRACTION_ATTN:
+                    pattern += "(gate|up|gate_up|down).*";
+                    break;
+                case LAYER_FRACTION_UP:
+                    pattern += "(gate|gate_up|down).*";
+                    break;
+                case LAYER_FRACTION_GATE:
+                    pattern += "down.*";
+                    break;
+                default:
+                    break;
+            }
+
+            tensor_buft_overrides[0].pattern = pattern.c_str();
+            tensor_buft_overrides[0].buft = ggml_backend_cpu_buffer_type();
+            tensor_buft_overrides[1].pattern = nullptr;
+            tensor_buft_overrides[1].buft = nullptr;
+            mparams_test.tensor_buft_overrides = tensor_buft_overrides;
+
+            dmds_t dmds_test = common_get_device_memory_data_impl(path_model, &mparams_test, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level);
+
+            bool fits = true;
+            for (size_t id = 0; id < nd; id++) {
+                if (dmds_test[id].mb.total() > targets[id]) {
+                    fits = false;
+                    break;
+                }
+            }
+
+            if (fits) {
+                LOG_TRC("%s: partial layer offload fits with fraction %d\n", __func__, (int)frac);
+                best_ngl = best_ngl + 1;
+                break;
+            }
+        }
+    }
+
+    // apply the best configuration
+    mparams->n_gpu_layers = best_ngl;
+    mparams->tensor_split = tensor_split;
+
+    LOG_TRC("%s: fitted n_gpu_layers = %u\n", __func__, best_ngl);
+}
+
 static void common_params_fit_impl(
         const char * path_model, struct llama_model_params * mparams, struct llama_context_params * cparams,
         float * tensor_split, struct llama_model_tensor_buft_override * tensor_buft_overrides,
         size_t * margins_s, uint32_t n_ctx_min, const common_fit_extra_model * extra, enum ggml_log_level log_level) {
     if (mparams->split_mode == LLAMA_SPLIT_MODE_TENSOR) {
-        throw common_params_fit_exception("llama_params_fit is not implemented for SPLIT_MODE_TENSOR, abort");
+        common_params_fit_tensor_split(path_model, mparams, cparams, tensor_split, tensor_buft_overrides, margins_s, n_ctx_min, extra, log_level);
+        return;
     }
     constexpr int64_t MiB = 1024*1024;
     typedef std::vector<llama_device_memory_data> dmds_t;
