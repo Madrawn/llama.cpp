@@ -75,6 +75,20 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
 
     llama_memory_breakdown memory_breakdown = llama_get_memory_breakdown(ctx);
 
+    size_t compute_copies = 1;
+    if (mparams->split_mode == LLAMA_SPLIT_MODE_TENSOR) {
+        compute_copies = 0;
+        if (mparams->devices) {
+            while (mparams->devices[compute_copies]) {
+                compute_copies++;
+            }
+        } else {
+            for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
+                compute_copies += ggml_backend_dev_buffer_type(ggml_backend_dev_get(i)) != ggml_backend_cpu_buffer_type();
+            }
+        }
+    }
+
     for (const auto & [buft, mb] : memory_breakdown) {
         if (ggml_backend_buft_is_host(buft)) {
             ret.back().mb.model   += mb.model;
@@ -91,7 +105,8 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
             if (dev == llama_model_get_device(model, i)) {
                 ret[i].mb.model   += mb.model;
                 ret[i].mb.context += mb.context;
-                ret[i].mb.compute += mb.compute;
+                // Meta allocates the full compute buffer on each physical device.
+                ret[i].mb.compute += mb.compute * compute_copies;
                 break;
             }
         }
